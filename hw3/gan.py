@@ -5,6 +5,9 @@ from typing import Callable
 from torch.utils.data import DataLoader
 from torch.optim.optimizer import Optimizer
 
+from torch.nn.modules import conv
+from torch.nn.modules.utils import _pair
+
 
 class Discriminator(nn.Module):
     def __init__(self, in_size):
@@ -20,22 +23,45 @@ class Discriminator(nn.Module):
         #  flatten the features.
         # ====== YOUR CODE: ======
         modules = []
-        modules.append(nn.Conv2d(in_channels=in_size[0], out_channels=64, kernel_size=(3, 3), ))
-        modules.append(nn.BatchNorm2d(num_features=64))
-        modules.append(nn.LeakyReLU())
-        modules.append(nn.Conv2d(in_channels=64, out_channels=128, kernel_size=(5, 5), stride=2, padding=2))
-        modules.append(nn.BatchNorm2d(num_features=128))
-        modules.append(nn.LeakyReLU())
-        modules.append(nn.Conv2d(in_channels=128, out_channels=256, kernel_size=(3, 3)))
-        modules.append(nn.BatchNorm2d(num_features=256))
-        modules.append(nn.LeakyReLU())
-        modules.append(nn.Conv2d(in_channels=256, out_channels=512, kernel_size=(3, 3), stride=2))
-        modules.append(nn.BatchNorm2d(num_features=512))
-        modules.append(nn.LeakyReLU())
-        modules.append(nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=(3, 3)))
-        modules.append(nn.BatchNorm2d(num_features=1024))
-        modules.append(nn.LeakyReLU())
-        modules.append(nn.Conv2d(in_channels=1024, out_channels=1, kernel_size=(12, 12)))
+        nc = 3
+        ndf = 64
+        # modules.append(nn.Conv2d(in_channels=in_size[0], out_channels=64, kernel_size=(3, 3), ))
+        modules.append(SNConv2d(nc, ndf, 3, 1, 1, bias=True)),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        modules.append(SNConv2d(ndf, ndf, 4, 2, 1, bias=True)),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        # state size. (ndf) x 1 x 32
+        modules.append(SNConv2d(ndf, ndf * 2, 3, 1, 1, bias=True)),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        modules.append(SNConv2d(ndf * 2, ndf * 2, 4, 2, 1, bias=True)),
+        # nn.BatchNorm2d(ndf * 2),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        # state size. (ndf*2) x 16 x 16
+        modules.append(SNConv2d(ndf * 2, ndf * 4, 3, 1, 1, bias=True)),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        modules.append(SNConv2d(ndf * 4, ndf * 4, 4, 2, 1, bias=True)),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        # state size. (ndf*8) x 4 x 4
+        modules.append(SNConv2d(ndf * 4, ndf * 8, 3, 1, 1, bias=True)),
+        modules.append(nn.LeakyReLU(0.1, inplace=True)),
+        modules.append(SNConv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
+        modules.append(nn.Sigmoid())
+
+        # modules.append(nn.BatchNorm2d(num_features=64))
+        # modules.append(nn.LeakyReLU())
+        # modules.append(nn.Conv2d(in_channels=64, out_channels=128, kernel_size=(5, 5), stride=2, padding=2))
+        # modules.append(nn.BatchNorm2d(num_features=128))
+        # modules.append(nn.LeakyReLU())
+        # modules.append(nn.Conv2d(in_channels=128, out_channels=256, kernel_size=(3, 3)))
+        # modules.append(nn.BatchNorm2d(num_features=256))
+        # modules.append(nn.LeakyReLU())
+        # modules.append(nn.Conv2d(in_channels=256, out_channels=512, kernel_size=(3, 3), stride=2))
+        # modules.append(nn.BatchNorm2d(num_features=512))
+        # modules.append(nn.LeakyReLU())
+        # modules.append(nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=(3, 3)))
+        # modules.append(nn.BatchNorm2d(num_features=1024))
+        # modules.append(nn.LeakyReLU())
+        # modules.append(nn.Conv2d(in_channels=1024, out_channels=1, kernel_size=(12, 12)))
         self.cnn = nn.Sequential(*modules)
         # ========================
 
@@ -291,3 +317,44 @@ def save_checkpoint(gen_model, dsc_losses, gen_losses, checkpoint_file):
     # ========================
 
     return saved
+
+
+class SNConv2d(conv._ConvNd):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+        super(SNConv2d, self).__init__(
+            in_channels, out_channels, _pair(kernel_size), _pair(stride), _pair(padding), _pair(dilation),
+            False, _pair(0), groups, bias, 'zeros')
+        self.register_buffer('u', torch.Tensor(1, out_channels).normal_())
+
+    @property
+    def Weights(self):
+        w_mat = self.weight.view(self.weight.size(0), -1)
+        sigma, u = max_singular_value(w_mat, self.u)
+        self.u.copy_(u)
+        return self.weight / sigma
+
+    def forward(self, x):
+        return F.conv2d(x, self.Weights, self.bias, self.stride,
+                        self.padding, self.dilation, self.groups)
+
+
+#define _l2normalization
+def _l2normalize(v, eps=1e-12):
+    return v / (torch.norm(v) + eps)
+
+
+def max_singular_value(W, u=None, Ip=1):
+    """
+    power iteration for weight parameter
+    """
+    #xp = W.data
+    if not Ip >= 1:
+        raise ValueError("Power iteration should be a positive integer")
+    if u is None:
+        u = torch.FloatTensor(1, W.size(0)).normal_(0, 1).cuda()
+    _u = u
+    for _ in range(Ip):
+        _v = _l2normalize(torch.matmul(_u, W.data), eps=1e-12)
+        _u = _l2normalize(torch.matmul(_v, torch.transpose(W.data, 0, 1)), eps=1e-12)
+    sigma = torch.sum(F.linear(_u, torch.transpose(W.data, 0, 1)) * _v)
+    return sigma, _u
